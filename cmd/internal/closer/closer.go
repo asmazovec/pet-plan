@@ -62,58 +62,75 @@ func (c *Closer) Add(r Releaser, ds ...*Dependency) (*Dependency, error) {
 	return from, nil
 }
 
-func (c *Closer) Close(ctx context.Context) (errs []error, err error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.Status == Released {
-		return nil, nil
-	}
-	c.Status = Released
-	for top, ok := c.extractTop(); ok; top, ok = c.extractTop() {
-		chError := make(chan error, len(top))
-		for _, dep := range top {
-			go func(dep *Dependency) {
-				if dep.releaser == nil {
-					chError <- nil
-					return
-				}
-				chError <- dep.releaser(ctx)
-			}(dep)
-		}
-		for i := 0; i < len(top); i++ {
-			select {
-			case e := <-chError:
-				if e == nil {
-					break
-				}
-				errs = append(errs, e)
-			case <-ctx.Done():
-				return nil, fmt.Errorf("shutdown cancelled: %v", ctx.Err())
+func (c *Closer) Close(ctx context.Context) (<-chan error, error) {
+	var (
+		errC = make(chan error)
+	)
+	go func() {
+		defer close(errC)
+		for {
+			layerC, ok := c.g.Layer(ctx)
+			if !ok {
+				break
 			}
+			c.g.Release(ctx, layerC, errC)
 		}
-	}
-	return errs, nil
+	}()
+	return errC, ctx.Err()
 }
 
-func (c *Closer) extractTop() (top []*Dependency, ok bool) {
-	if len(c.g) == 0 {
+func (g graph) Layer(ctx context.Context) (<-chan *Dependency, bool) {
+	deps, ok := g.topologicalLayer()
+	if !ok {
+		return nil, false
+	}
+	ch := make(chan *Dependency, len(deps))
+	go func() {
+		defer close(ch)
+		for _, dep := range deps {
+			select {
+			case ch <- dep:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+	return ch, true
+}
+
+func (g graph) Release(ctx context.Context, deps <-chan *Dependency, errC chan<- error) {
+	for dep := range deps {
+		err := dep.releaser(ctx)
+		if err == nil {
+			continue
+		}
+		select {
+		case errC <- err:
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+func (g graph) topologicalLayer() (top []*Dependency, ok bool) {
+	if len(g) == 0 {
 		return nil, false
 	}
 	visited := make(map[*Dependency]bool)
-	for from, ends := range c.g {
+	for from, ends := range g {
 		for to := range ends {
-			if !c.g[from][to] {
+			if !g[from][to] {
 				continue
 			}
 			visited[to] = true
 		}
 	}
-	for n := range c.g {
+	for n := range g {
 		if visited[n] {
 			continue
 		}
 		top = append(top, n)
-		delete(c.g, n)
+		delete(g, n)
 	}
 	return top, true
 }

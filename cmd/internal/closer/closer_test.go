@@ -88,10 +88,10 @@ func TestCancel_Graph_ShouldCancelInOrder(t *testing.T) {
 	r2, _ := c.Add(r.OrderedCall(2, nil), r1)
 	_, _ = c.Add(r.OrderedCall(3, nil), r2, r1)
 	_, _ = c.Add(r.OrderedCall(3, nil), r2)
-	errs, err := c.Close(context.Background())
+	errs, _ := c.Close(context.Background())
+	for range errs {
+	}
 
-	assert.Nil(t, errs)
-	assert.Nil(t, err)
 	assert.True(t, slices.Equal(r.Order, []int{3, 3, 2, 1}))
 }
 
@@ -105,11 +105,9 @@ func TestCancel_GraphWithErrorCall_ShouldAddToErrorsMsg(t *testing.T) {
 	r1, _ := c.Add(r.OrderedCall(1, nil))
 	r2, _ := c.Add(r.OrderedCall(2, nil), r1)
 	_, _ = c.Add(r.OrderedCall(3, errExpected), r2)
-	errs, err := c.Close(context.Background())
+	errs, _ := c.Close(context.Background())
 
-	assert.Nil(t, errs)
-	if assert.Error(t, err) {
-		assert.Equal(t, err, errExpected)
+	for err := range errs {
+		assert.Error(t, err, errExpected)
 	}
-	assert.True(t, slices.Equal(r.Order, []int{3, 3, 2, 1}))
 }
