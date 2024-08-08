@@ -55,7 +55,7 @@
 			<div id="nav">
 				<select id="files">
 				
-				<option value="file0">plans/cmd/internal/closer/closer.go (87.0%)</option>
+				<option value="file0">plans/cmd/internal/closer/closer.go (95.5%)</option>
 				
 				</select>
 			</div>
@@ -74,114 +74,151 @@
 import (
         "context"
         "fmt"
+        "sync"
 )
 
 type (
         Releaser func(context.Context) error
-        graph    map[id]map[id]bool
-        id       int
+        graph    map[*Dependency]map[*Dependency]bool
+        status   int
 )
 
+const (
+        Ready status = iota
+        Released
+)
+
+// Dependency presents a service resource, could be released.
+// User out of this package should be never able to release Dependency manually.
 type Dependency struct {
-        id       id
-        c        *Closer
         releaser Releaser
 }
 
+// Closer is a closer pattern for graceful shutdown.
+// Closer walks on dependencies and emit release of each resource.
 type Closer struct {
-        g      graph
-        deps   map[id]*Dependency
-        nextId id
+        mu sync.Mutex
+        g  graph
 }
 
-func (c *Closer) newDependency(r Releaser) *Dependency <span class="cov8" title="1">{
-        d := &amp;Dependency{
-                id:       c.nextId,
-                c:        c,
-                releaser: r,
-        }
-        c.nextId++
-        return d
-}</span>
-
-// Add registers a dependant resource with releaser for graceful shutdown and associated dependencies.
+// Add instantiate a new dependant resource with releaser and dependencies.
 func (c *Closer) Add(r Releaser, ds ...*Dependency) (*Dependency, error) <span class="cov8" title="1">{
-        const op = "instantiating dependency"
+        const op = "adding dependency"
+        c.mu.Lock()
+        defer c.mu.Unlock()
 
         // Verify dependencies.
         for _, d := range ds </span><span class="cov8" title="1">{
                 if d == nil </span><span class="cov8" title="1">{
-                        return nil, fmt.Errorf("%s: nil dependency", op)
+                        return nil, fmt.Errorf("%s: dependency is nil", op)
                 }</span>
-                <span class="cov8" title="1">if d.c != c </span><span class="cov8" title="1">{
-                        return nil, fmt.Errorf("%s: dependency is not associated with canceler", op)
-                }</span>
-                <span class="cov8" title="1">if c.deps[d.id] == nil </span><span class="cov0" title="0">{
-                        return nil, fmt.Errorf("%s: dependency not found", op)
+                <span class="cov8" title="1">if _, ok := c.g[d]; !ok </span><span class="cov8" title="1">{
+                        return nil, fmt.Errorf("%s: dependency not associated with current canceler", op)
                 }</span>
         }
 
-        <span class="cov8" title="1">from := c.newDependency(r)
-        err := c.register(from, ds...)
-        if err != nil </span><span class="cov0" title="0">{
-                return nil, fmt.Errorf("%s: %v", op, err)
+        <span class="cov8" title="1">if c.g == nil </span><span class="cov8" title="1">{
+                c.g = make(graph, len(ds))
         }</span>
+        <span class="cov8" title="1">from := &amp;Dependency{releaser: r}
+        c.g[from] = make(map[*Dependency]bool)
+        for _, to := range ds </span><span class="cov8" title="1">{
+                c.g[from][to] = true
+        }</span>
+
         <span class="cov8" title="1">return from, nil</span>
 }
 
-func (c *Closer) register(from *Dependency, ds ...*Dependency) error <span class="cov8" title="1">{
-        const op = "register dependencies"
+func (c *Closer) Close(ctx context.Context) &lt;-chan error <span class="cov8" title="1">{
+        var errC = make(chan error)
+        go func() </span><span class="cov8" title="1">{
+                c.mu.Lock()
+                defer c.mu.Unlock()
 
-        if c.g == nil </span><span class="cov8" title="1">{
-                c.g = make(graph)
-        }</span>
-        <span class="cov8" title="1">for _, to := range ds </span><span class="cov8" title="1">{
-                ok := c.g.noCycleWith(from.id, to.id)
-                if !ok </span><span class="cov0" title="0">{
-                        return fmt.Errorf("%s: cycle dependency", op)
-                }</span>
-                <span class="cov8" title="1">end := c.g[from.id]
-                if end == nil </span><span class="cov8" title="1">{
-                        end = make(map[id]bool)
-                        c.g[from.id] = end
-                }</span>
-                <span class="cov8" title="1">end[to.id] = true</span>
-        }
-
-        <span class="cov8" title="1">if c.deps == nil </span><span class="cov8" title="1">{
-                c.deps = make(map[id]*Dependency)
-        }</span>
-        <span class="cov8" title="1">c.deps[from.id] = from
-
-        return nil</span>
+                defer close(errC)
+                for </span><span class="cov8" title="1">{
+                        layerC, size := c.g.Layer(ctx)
+                        if size == 0 </span><span class="cov8" title="1">{
+                                break</span>
+                        }
+                        <span class="cov8" title="1">for err := range c.g.Release(ctx, size, layerC) </span><span class="cov8" title="1">{
+                                errC &lt;- err
+                        }</span>
+                }
+        }()
+        <span class="cov8" title="1">return errC</span>
 }
 
-func (g graph) noCycleWith(from id, to id) (ok bool) <span class="cov8" title="1">{
-        var (
-                visited = make(map[id]bool)
-                stack   = make([]id, 0, 1)
-                curr    id
-        )
+func (g graph) Release(ctx context.Context, workers int, deps &lt;-chan *Dependency) &lt;-chan error <span class="cov8" title="1">{
+        var wg sync.WaitGroup
+        errC := make(chan error)
 
-        stack = append(stack, to)
-        for len(stack) &gt; 0 </span><span class="cov8" title="1">{
-                curr, stack = stack[0], stack[1:]
-                if visited[curr] </span><span class="cov0" title="0">{
-                        continue</span>
-                }
-                <span class="cov8" title="1">visited[curr] = true
-                for nodeID := range g[curr] </span><span class="cov8" title="1">{
-                        if nodeID == from </span><span class="cov0" title="0">{
-                                return false // Cycle found.
-                        }</span>
-                        <span class="cov8" title="1">if visited[nodeID] </span><span class="cov0" title="0">{
-                                continue</span> // Don't visit again.
+        release := func() </span><span class="cov8" title="1">{
+                defer wg.Done()
+                for dep := range deps </span><span class="cov8" title="1">{
+                        if dep.releaser == nil </span><span class="cov8" title="1">{
+                                continue</span>
                         }
-                        <span class="cov8" title="1">stack = append(stack, nodeID)</span>
+                        <span class="cov8" title="1">select </span>{
+                        case errC &lt;- dep.releaser(ctx):<span class="cov8" title="1"></span>
+                        case &lt;-ctx.Done():<span class="cov0" title="0">
+                                return</span>
+                        }
                 }
         }
 
-        <span class="cov8" title="1">return true</span>
+        <span class="cov8" title="1">wg.Add(workers)
+        for i := 0; i &lt; workers; i++ </span><span class="cov8" title="1">{
+                go release()
+        }</span>
+        <span class="cov8" title="1">go func() </span><span class="cov8" title="1">{
+                defer close(errC)
+                wg.Wait()
+        }</span>()
+
+        <span class="cov8" title="1">return errC</span>
+}
+
+func (g graph) Layer(ctx context.Context) (&lt;-chan *Dependency, int) <span class="cov8" title="1">{
+        deps, ok := g.topologicalLayer()
+        if !ok </span><span class="cov8" title="1">{
+                return nil, 0
+        }</span>
+        <span class="cov8" title="1">ch := make(chan *Dependency, len(deps))
+        go func() </span><span class="cov8" title="1">{
+                defer close(ch)
+                for _, dep := range deps </span><span class="cov8" title="1">{
+                        select </span>{
+                        case ch &lt;- dep:<span class="cov8" title="1"></span>
+                        case &lt;-ctx.Done():<span class="cov0" title="0">
+                                return</span>
+                        }
+                }
+        }()
+        <span class="cov8" title="1">return ch, len(deps)</span>
+}
+
+func (g graph) topologicalLayer() (top []*Dependency, ok bool) <span class="cov8" title="1">{
+        if len(g) == 0 </span><span class="cov8" title="1">{
+                return nil, false
+        }</span>
+        <span class="cov8" title="1">visited := make(map[*Dependency]bool)
+        for from, ends := range g </span><span class="cov8" title="1">{
+                for to := range ends </span><span class="cov8" title="1">{
+                        if !g[from][to] </span><span class="cov0" title="0">{
+                                continue</span>
+                        }
+                        <span class="cov8" title="1">visited[to] = true</span>
+                }
+        }
+        <span class="cov8" title="1">for n := range g </span><span class="cov8" title="1">{
+                if visited[n] </span><span class="cov8" title="1">{
+                        continue</span>
+                }
+                <span class="cov8" title="1">top = append(top, n)
+                delete(g, n)</span>
+        }
+        <span class="cov8" title="1">return top, true</span>
 }
 </pre>
 		

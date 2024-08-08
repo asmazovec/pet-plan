@@ -6,30 +6,23 @@ import (
 	"sync"
 )
 
+type (
+	Releaser func(context.Context) error
+	graph    map[*Dependency]map[*Dependency]bool
+)
+
 // Dependency presents a service resource, could be released.
 // User out of this package should be never able to release Dependency manually.
 type Dependency struct {
 	releaser Releaser
 }
 
-const (
-	Ready status = iota
-	Released
-)
-
 // Closer is a closer pattern for graceful shutdown.
 // Closer walks on dependencies and emit release of each resource.
 type Closer struct {
-	Status status
-	mu     sync.Mutex
-	g      graph
+	mu sync.Mutex
+	g  graph
 }
-
-type (
-	Releaser func(context.Context) error
-	graph    map[*Dependency]map[*Dependency]bool
-	status   int
-)
 
 // Add instantiate a new dependant resource with releaser and dependencies.
 func (c *Closer) Add(r Releaser, ds ...*Dependency) (*Dependency, error) {
@@ -47,9 +40,6 @@ func (c *Closer) Add(r Releaser, ds ...*Dependency) (*Dependency, error) {
 		}
 	}
 
-	if c.Status != Ready {
-		return nil, fmt.Errorf("%s: canceller actually not ready", op)
-	}
 	if c.g == nil {
 		c.g = make(graph, len(ds))
 	}
@@ -62,27 +52,65 @@ func (c *Closer) Add(r Releaser, ds ...*Dependency) (*Dependency, error) {
 	return from, nil
 }
 
-func (c *Closer) Close(ctx context.Context) (<-chan error, error) {
-	var (
-		errC = make(chan error)
-	)
+// Close releases dependencies keeping dependency order.
+// If releasers done with errors, they send it to the error channel.
+func (c *Closer) Close(ctx context.Context) <-chan error {
+	var errC = make(chan error)
 	go func() {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+
 		defer close(errC)
 		for {
-			layerC, ok := c.g.Layer(ctx)
-			if !ok {
+			layerC, size := c.g.Layer(ctx)
+			if size == 0 {
 				break
 			}
-			c.g.Release(ctx, layerC, errC)
+			for err := range c.g.Release(ctx, size, layerC) {
+				errC <- err
+			}
 		}
 	}()
-	return errC, ctx.Err()
+	return errC
 }
 
-func (g graph) Layer(ctx context.Context) (<-chan *Dependency, bool) {
+// Release gets a layer pipeline and release it up.
+// Results sends to the error channel.
+func (g graph) Release(ctx context.Context, workers int, deps <-chan *Dependency) <-chan error {
+	var wg sync.WaitGroup
+	errC := make(chan error)
+
+	release := func() {
+		defer wg.Done()
+		for dep := range deps {
+			if dep.releaser == nil {
+				continue
+			}
+			select {
+			case errC <- dep.releaser(ctx):
+			case <-ctx.Done():
+				return
+			}
+		}
+	}
+
+	wg.Add(workers)
+	for i := 0; i < workers; i++ {
+		go release()
+	}
+	go func() {
+		defer close(errC)
+		wg.Wait()
+	}()
+
+	return errC
+}
+
+// Layer produces dependencies from topological layer and sends it to dependency channel.
+func (g graph) Layer(ctx context.Context) (<-chan *Dependency, int) {
 	deps, ok := g.topologicalLayer()
 	if !ok {
-		return nil, false
+		return nil, 0
 	}
 	ch := make(chan *Dependency, len(deps))
 	go func() {
@@ -95,21 +123,7 @@ func (g graph) Layer(ctx context.Context) (<-chan *Dependency, bool) {
 			}
 		}
 	}()
-	return ch, true
-}
-
-func (g graph) Release(ctx context.Context, deps <-chan *Dependency, errC chan<- error) {
-	for dep := range deps {
-		err := dep.releaser(ctx)
-		if err == nil {
-			continue
-		}
-		select {
-		case errC <- err:
-		case <-ctx.Done():
-			return
-		}
-	}
+	return ch, len(deps)
 }
 
 func (g graph) topologicalLayer() (top []*Dependency, ok bool) {
